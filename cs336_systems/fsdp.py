@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from einops import einsum, rearrange
+from einops import einsum
 
 from cs336_basics.model import Embedding, Linear, RMSNorm
 
@@ -27,7 +27,6 @@ class ShardedModule(torch.nn.Module):
         self.full_weight.requires_grad_(True)
         self.full_weight.retain_grad()
 
-        # TODO delegate forward
         if isinstance(self.module, Linear):
             return einsum(inputs[0], self.full_weight, "... d_in, d_out d_in -> ... d_out")
         elif isinstance(self.module, Embedding):
@@ -90,7 +89,7 @@ class ShardedModule(torch.nn.Module):
         shard_len = len(self.module.weight)
         local_grad = torch.zeros((shard_len), device=self.module.weight.device)
 
-        grad_shards = torch.chunk(flat_grad, self.world_size)
+        grad_shards = list(torch.chunk(flat_grad, self.world_size))
         dist.reduce_scatter(local_grad, grad_shards, op=dist.ReduceOp.AVG)
 
         with torch.no_grad():
@@ -121,14 +120,19 @@ class FullyShardedDataParallel(torch.nn.Module):
             else:
                 self._build_sharded_modules(child)
 
-    def _forward_pre_hook(self, module, input) -> None:
-        # Wait for all-gather to finish
-        pass
+    def get_unsharded_state_dict(self):
 
-    def _forward_post_hook(self, module, input, output) -> None:
-        # Prefetch weights for layer i+2
-        pass
+        state_dict = {}
+  
+        for mod_name, module in self.module.named_modules():
 
+            if isinstance(module, ShardedModule):
+                state_dict[f"{mod_name}.weight"] = module.unshard()
+            elif isinstance(module, RMSNorm):
+                for param_name, param in module.named_parameters(recurse=False):
+                    state_dict[f"{mod_name}.{param_name}"] = param
+
+        return state_dict
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
