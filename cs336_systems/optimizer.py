@@ -31,7 +31,7 @@ class ShardedOptimizer(torch.optim.Optimizer):
     def step(self, closure=None, **kwargs): 
         ret = self.local_optimizer.step(closure, **kwargs)
 
-        # broad the local rank's updated params to all other ranks
+        # broadcast the local rank's updated params to all other ranks
         for rank in range(self.world_size):
             for pg in self.rank_param_groups[rank]:
                 for p in pg["params"]:
@@ -41,7 +41,7 @@ class ShardedOptimizer(torch.optim.Optimizer):
         return ret
 
     def _get_local_param_groups(self):
-        return [p for p in self.rank_param_groups[self.rank]]
+        return [pg for pg in self.rank_param_groups[self.rank]]
 
     def add_param_group(self, param_group: dict[str, Any]):
 

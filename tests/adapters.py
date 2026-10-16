@@ -68,29 +68,8 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # For example: ddp_model.finish_gradient_synchronization()
-
+    # For example: ddp_model.finish_gradient_synchronization()do
     ddp_model.finish_gradient_synchronization()
-
-    # grads = []
-    
-    # for param in ddp_model.module.parameters():
-    #     if param.grad is not None:
-    #         grads.append(param.grad)
-
-    #         # dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-
-    # flat_grad = torch._utils._flatten_dense_tensors(grads)
-    # dist.all_reduce(flat_grad, op=dist.ReduceOp.AVG)
-
-    # grads = torch._utils._unflatten_dense_tensors(flat_grad, grads)
-    # i = 0
-
-    # for param in ddp_model.module.parameters():
-    #     if param.grad is not None:
-    #         with torch.no_grad():
-    #             param.grad.copy_(grads[i])
-    #             i += 1
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
