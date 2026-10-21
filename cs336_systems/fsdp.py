@@ -8,11 +8,12 @@ from cs336_basics.model import Embedding, Linear, RMSNorm
 
 class ShardedModule(torch.nn.Module):
 
-    def __init__(self, module: torch.nn.Module, rank: int, world_size: int):
+    def __init__(self, module: torch.nn.Module, rank: int, world_size: int, compute_dtype: torch.dtype | None = None):
         super().__init__()
         self.module = module
         self.shape = module.weight.shape
         self.dtype = module.weight.dtype
+        self.compute_dtype = compute_dtype
         self.rank = rank
         self.world_size = world_size
         self.padding = self._calculate_padding()
@@ -33,11 +34,15 @@ class ShardedModule(torch.nn.Module):
 
         self.full_weight.requires_grad_(True)
         self.full_weight.retain_grad()
+        
+        compute_weight = self.full_weight
+        if self.compute_dtype:
+            compute_weight = self.full_weight.to(self.compute_dtype)
 
         if isinstance(self.module, Linear):
-            out = einsum(inputs[0], self.full_weight, "... d_in, d_out d_in -> ... d_out")
+            out = einsum(inputs[0], compute_weight, "... d_in, d_out d_in -> ... d_out")
         elif isinstance(self.module, Embedding):
-            out = self.full_weight[inputs[0], :]
+            out = compute_weight[inputs[0], :]
         else:
             raise Exception("Unsupported nn.Module")
         
@@ -109,24 +114,6 @@ class ShardedModule(torch.nn.Module):
         self.prefetch_handle = None
 
         return full_weight
-
-        
-    # def unshard(self):
-    #     shard_len = len(self.module.weight)
-    #     shard_tensors = [torch.zeros((shard_len,), device=self.module.weight.device) for _ in range(self.world_size)]
-
-    #     dist.all_gather(shard_tensors, self.module.weight)
-
-    #     # Concatenate
-    #     flat_tensor = torch.cat(shard_tensors)
-
-    #     # Remove padding
-    #     if self.padding > 0:
-    #         flat_tensor = flat_tensor[:-self.padding]
-
-    #     # Reshape
-    #     full_weight = torch.reshape(flat_tensor, self.shape)
-    #     return full_weight
     
     def shard_gradient(self):
         flat_grad = self._flatten_and_pad(self.full_weight.grad)
@@ -164,12 +151,14 @@ class FullyShardedDataParallel(torch.nn.Module):
             target = self.module_list[i+prefetch_layers]
             self.module_list[i]._set_prefetch_fn(target._start_gather)
 
+        # TODO: implement prefetching for backwards too
+
 
     def _build_sharded_modules(self, parent):
 
         for name, child in parent.named_children():
             if isinstance(child, Embedding) or isinstance(child, Linear):
-                sharded_module = ShardedModule(child, rank=self.rank, world_size=self.world_size)
+                sharded_module = ShardedModule(child, rank=self.rank, world_size=self.world_size, compute_dtype=self.compute_dtype)
                 parent.add_module(name, sharded_module)
                 self.module_list.append(sharded_module)
                 self.module_idx += 1
