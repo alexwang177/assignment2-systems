@@ -8,15 +8,13 @@ These tests use the common SP+TP layout:
   sequence to be replicated;
 * the result can be scattered again after the TP operation.
 
-The distributed tests are expected to fail while the starter helpers remain
-unimplemented.
+The distributed tests validate the sequence-parallel communication and
+its composition with tensor parallelism.
 """
 
 from __future__ import annotations
 
-import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
@@ -25,25 +23,12 @@ from cs336_systems.sequence_parallel import (
     SequenceParallelTensorParallelMLP,
     gather_sequence,
     scatter_sequence,
-    sequence_parallel_layer,
 )
 from cs336_systems.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from tests.common import _cleanup_process_group, _setup_process_group
 
 
 WORLD_SIZE = 2
-
-
-def test_sequence_parallel_interfaces_are_unimplemented():
-    x = torch.randn(2, 4, 8)
-    for operation in (scatter_sequence, gather_sequence):
-        with pytest.raises(NotImplementedError):
-            operation(x)
-    with pytest.raises(NotImplementedError):
-        sequence_parallel_layer(nn.Identity(), x)
-    composition = SequenceParallelTensorParallelMLP(nn.Identity(), nn.Identity())
-    with pytest.raises(NotImplementedError):
-        composition(x)
 
 
 def _sp_scatter_gather_worker(rank, world_size):
@@ -62,7 +47,6 @@ def _sp_scatter_gather_worker(rank, world_size):
     _cleanup_process_group()
 
 
-@pytest.mark.xfail(strict=False, reason="Sequence parallel collectives are starter interfaces")
 def test_sequence_scatter_gather_round_trip_across_ranks():
     mp.spawn(_sp_scatter_gather_worker, args=(WORLD_SIZE,), nprocs=WORLD_SIZE, join=True)
 
@@ -86,7 +70,6 @@ def _sp_gradient_worker(rank, world_size):
     _cleanup_process_group()
 
 
-@pytest.mark.xfail(strict=False, reason="Sequence parallel autograd collectives are starter interfaces")
 def test_sequence_scatter_gather_backward_matches_reference():
     mp.spawn(_sp_gradient_worker, args=(WORLD_SIZE,), nprocs=WORLD_SIZE, join=True)
 
@@ -130,13 +113,10 @@ def _sp_tp_mlp_worker(rank, world_size):
         group=None,
     )
 
-    # The composition itself is intentionally left for the learner to write
-    # in SequenceParallelTensorParallelMLP.forward().
     actual = tp_block(x)
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
     _cleanup_process_group()
 
 
-@pytest.mark.xfail(strict=False, reason="Sequence-parallel and tensor-parallel composition is a starter exercise")
 def test_sequence_parallel_composes_with_tensor_parallel_mlp():
     mp.spawn(_sp_tp_mlp_worker, args=(WORLD_SIZE,), nprocs=WORLD_SIZE, join=True)
