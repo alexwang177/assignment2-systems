@@ -10,13 +10,21 @@ interfaces for the remaining topics in `AGENTS.md`.
 3. Sequence parallelism
 4. Pipeline parallelism
 5. Context parallelism
+   - fixed-length all-gather attention
+   - packed variable-length attention
+   - ring attention with online softmax
+   - Ulysses/all-to-all attention
+   - hybrid ring/Ulysses attention
 6. Expert parallelism
 7. N-dimensional composition
 
-The starter tests in `tests/test_parallelism_boilerplate.py` intentionally test
-only the interfaces and configuration validation. Replace each
-`NotImplementedError` expectation with CPU/Gloo correctness tests as the
-corresponding technique is implemented.
+The context-parallel tests in `tests/test_cp.py` are ordered as a learning
+sequence. The initial tests validate configuration; later tests are expected
+failures until each algorithm is implemented. Replace the expected-failure
+markers with CPU/Gloo multi-process correctness tests as each stage is
+completed. Keep variable-length attention separate from the communication
+algorithm: it is a packed-input layout that can be combined with all-gather,
+ring, or Ulysses attention.
 
 ## CPU/MPS constraint
 
