@@ -46,11 +46,24 @@ class AllGatherWithReduceScatter(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, group=None, dim: int = -2):
-        raise NotImplementedError("Implement the all-gather forward collective")
+        world_size = dist.get_world_size(group)
+        ctx.world_size = world_size
+        ctx.dim = dim
+        ctx.group = group
+
+        lst = [torch.zeros_like(x) for _ in range(world_size)]
+        dist.all_gather(lst, x, group=group)
+
+        return torch.concat(lst, dim)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        raise NotImplementedError("Implement reduce-scatter in the all-gather backward")
+        lst = list(torch.chunk(grad_output, chunks=ctx.world_size, dim=ctx.dim))
+        lst = [chunk.contiguous() for chunk in lst]
+        local_grad = torch.zeros_like(lst[0])
+        dist.reduce_scatter(local_grad, lst, group=ctx.group)
+
+        return (local_grad, None, None)
 
 
 def all_gather_autograd(x: torch.Tensor, *, group=None, dim: int = -2) -> torch.Tensor:
@@ -155,14 +168,9 @@ def all_gather_attention(
 
     if world_size > 1:
         # All gather the local K tensors and concatenate along sequence dimension
-        key_lst = [torch.zeros_like(key, device=key.device) for _ in range(world_size)]
-        dist.all_gather(key_lst, key, group=group)
-        full_key = torch.concat(key_lst, dim=-2)
-
+        full_key = all_gather_autograd(key, group=group, dim=-2)
         # All gather the local V tensors and concatenate along sequence dimension
-        val_lst = [torch.zeros_like(value, device=value.device) for _ in range(world_size)]
-        dist.all_gather(val_lst, value, group=group)
-        full_value = torch.concat(val_lst, dim=-2)
+        full_value = all_gather_autograd(value, group=group, dim=-2)
     else:
         full_key = key
         full_value = value

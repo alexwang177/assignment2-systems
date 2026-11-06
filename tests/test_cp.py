@@ -52,9 +52,79 @@ def test_custom_all_gather_function_has_forward_and_backward_hooks():
     assert hasattr(AllGatherWithReduceScatter, "backward")
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Implement autograd-aware all-gather")
-def test_custom_all_gather_is_not_implemented_yet():
-    all_gather_autograd(torch.randn(2, 2, 4, 4))
+def _all_gather_backward_worker(rank, world_size):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+
+    local_x = torch.ones(2, 2, 4, 4, device=device, requires_grad=True)
+    full_x = all_gather_autograd(local_x, group=None, dim=-2)
+    rank_weight = torch.full_like(full_x, rank + 1)
+    (full_x * rank_weight).sum().backward()
+
+    # Each local shard contributes to every rank's gathered output. The
+    # corresponding gradient chunks are therefore summed across ranks.
+    expected_grad = torch.full_like(local_x, sum(range(1, world_size + 1)))
+    torch.testing.assert_close(local_x.grad, expected_grad)
+    _cleanup_process_group()
+
+
+def test_custom_all_gather_backward_reduce_scatters_gradients():
+    mp.spawn(
+        _all_gather_backward_worker,
+        args=(2,),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _all_gather_attention_backward_worker(rank, world_size, causal):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(456)
+
+    batch, heads, sequence, head_dim = 2, 2, 8, 4
+    full_query = torch.randn(batch, heads, sequence, head_dim, device=device, requires_grad=True)
+    full_key = torch.randn(batch, heads, sequence, head_dim, device=device, requires_grad=True)
+    full_value = torch.randn(batch, heads, sequence, head_dim, device=device, requires_grad=True)
+    grad_output = torch.randn(batch, heads, sequence, head_dim, device=device)
+
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        full_query,
+        full_key,
+        full_value,
+        is_causal=causal,
+    )
+    (reference_output * grad_output).sum().backward()
+
+    expected_query_grad = full_query.grad.chunk(world_size, dim=-2)[rank]
+    expected_key_grad = full_key.grad.chunk(world_size, dim=-2)[rank]
+    expected_value_grad = full_value.grad.chunk(world_size, dim=-2)[rank]
+
+    local_query = full_query.detach().chunk(world_size, dim=-2)[rank].contiguous().requires_grad_()
+    local_key = full_key.detach().chunk(world_size, dim=-2)[rank].contiguous().requires_grad_()
+    local_value = full_value.detach().chunk(world_size, dim=-2)[rank].contiguous().requires_grad_()
+
+    actual_output = all_gather_attention(
+        local_query,
+        local_key,
+        local_value,
+        causal=causal,
+    )
+    local_grad_output = grad_output.chunk(world_size, dim=-2)[rank]
+    (actual_output * local_grad_output).sum().backward()
+
+    torch.testing.assert_close(local_query.grad, expected_query_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_key.grad, expected_key_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_value.grad, expected_value_grad, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_all_gather_attention_backward_matches_full_attention(causal):
+    mp.spawn(
+        _all_gather_attention_backward_worker,
+        args=(2, causal),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 1: implement all-gather CP")
