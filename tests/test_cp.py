@@ -7,9 +7,12 @@ through the stages.
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 from cs336_systems.context_parallel import (
     SUPPORTED_CONTEXT_PARALLEL_MODES,
+    AllGatherWithReduceScatter,
+    all_gather_autograd,
     ContextParallelAttention,
     ContextParallelConfig,
     all_gather_attention,
@@ -19,6 +22,7 @@ from cs336_systems.context_parallel import (
     ulysses_attention,
     varlen_all_gather_attention,
 )
+from tests.common import _cleanup_process_group, _setup_process_group
 
 
 def _inputs(sequence_length=8):
@@ -43,12 +47,58 @@ def test_cp_wrapper_is_configurable_without_initializing_distributed():
     assert attention.config.causal is False
 
 
+def test_custom_all_gather_function_has_forward_and_backward_hooks():
+    assert hasattr(AllGatherWithReduceScatter, "forward")
+    assert hasattr(AllGatherWithReduceScatter, "backward")
+
+
+@pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Implement autograd-aware all-gather")
+def test_custom_all_gather_is_not_implemented_yet():
+    all_gather_autograd(torch.randn(2, 2, 4, 4))
+
+
 @pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 1: implement all-gather CP")
 def test_stage_1_all_gather_matches_reference_on_one_rank():
     query, key, value = _inputs()
     actual = all_gather_attention(query, key, value, causal=False)
     expected = torch.nn.functional.scaled_dot_product_attention(query, key, value, is_causal=False)
     torch.testing.assert_close(actual, expected)
+
+
+def _all_gather_forward_worker(rank, world_size, causal):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(123)
+
+    batch, heads, sequence, head_dim = 2, 2, 8, 4
+    query = torch.randn(batch, heads, sequence, head_dim, device=device)
+    key = torch.randn(batch, heads, sequence, head_dim, device=device)
+    value = torch.randn(batch, heads, sequence, head_dim, device=device)
+
+    local_query = query.chunk(world_size, dim=-2)[rank].contiguous()
+    local_key = key.chunk(world_size, dim=-2)[rank].contiguous()
+    local_value = value.chunk(world_size, dim=-2)[rank].contiguous()
+
+    actual = all_gather_attention(local_query, local_key, local_value, causal=causal)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        is_causal=causal,
+    )
+    expected = expected.chunk(world_size, dim=-2)[rank]
+
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_1_all_gather_matches_reference_across_two_cpu_processes(causal):
+    mp.spawn(
+        _all_gather_forward_worker,
+        args=(2, causal),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 1: implement the CP wrapper")

@@ -21,10 +21,41 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 
 ContextParallelMode = Literal["all_gather", "ring", "ulysses", "hybrid"]
 SUPPORTED_CONTEXT_PARALLEL_MODES = ("all_gather", "ring", "ulysses", "hybrid")
+
+
+class AllGatherWithReduceScatter(torch.autograd.Function):
+    """Boilerplate for an autograd-aware all-gather.
+
+    Forward contract:
+        local ``x`` -> the rank-ordered concatenation of every rank's ``x``.
+
+    Backward contract:
+        Split ``grad_output`` into rank-ordered chunks, sum corresponding
+        chunks across the process group with reduce-scatter, and return only
+        this rank's local gradient.
+
+    This is the key gradient rule for gathered K/V: every rank contributes to
+    the gradient of every K/V partition.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, group=None, dim: int = -2):
+        raise NotImplementedError("Implement the all-gather forward collective")
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        raise NotImplementedError("Implement reduce-scatter in the all-gather backward")
+
+
+def all_gather_autograd(x: torch.Tensor, *, group=None, dim: int = -2) -> torch.Tensor:
+    """Apply the custom autograd all-gather once its Function is implemented."""
+    return AllGatherWithReduceScatter.apply(x, group, dim)
 
 
 @dataclass(frozen=True)
@@ -92,17 +123,56 @@ def exchange_context_partition(x: torch.Tensor, *, group=None, async_op: bool = 
 
 
 def all_gather_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    query: torch.Tensor, # [batch, heads, local_sequence, head_dim]
+    key: torch.Tensor,   # [batch, heads, local_sequence, head_dim]
+    value: torch.Tensor, # [batch, heads, local_sequence, head_dim]
     *,
     group=None,
     causal: bool = True,
-    query_start: int = 0,
     key_start: int = 0,
 ) -> torch.Tensor:
     """Stage 1: gather K/V, then compute attention for local queries."""
-    raise NotImplementedError
+
+    if not dist.is_initialized():
+        rank = 0
+        world_size = 1
+    else:
+        rank = dist.get_rank(group)
+        world_size = dist.get_world_size(group)
+
+    local_seq_len = query.shape[-2]
+    full_seq_len = local_seq_len * world_size
+
+    query_start = rank * local_seq_len
+
+    query_positions = query_start + torch.arange(start=0, end=local_seq_len, device=query.device)
+    key_positions = key_start + torch.arange(start=0, end=full_seq_len, device=query.device)
+
+    causal_mask = None
+    if causal:
+        causal_mask = query_positions[:, None] >= key_positions[None, :]
+        causal_mask = causal_mask[None, None, :, :]
+
+    if world_size > 1:
+        # All gather the local K tensors and concatenate along sequence dimension
+        key_lst = [torch.zeros_like(key, device=key.device) for _ in range(world_size)]
+        dist.all_gather(key_lst, key, group=group)
+        full_key = torch.concat(key_lst, dim=-2)
+
+        # All gather the local V tensors and concatenate along sequence dimension
+        val_lst = [torch.zeros_like(value, device=value.device) for _ in range(world_size)]
+        dist.all_gather(val_lst, value, group=group)
+        full_value = torch.concat(val_lst, dim=-2)
+    else:
+        full_key = key
+        full_value = value
+
+    return F.scaled_dot_product_attention(
+        query=query,
+        key=full_key,
+        value=full_value,
+        attn_mask=causal_mask
+    )
 
 
 def varlen_all_gather_attention(
