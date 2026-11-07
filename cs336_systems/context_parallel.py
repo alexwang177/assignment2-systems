@@ -183,18 +183,161 @@ def all_gather_attention(
     )
 
 
-def varlen_all_gather_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+def _local_varlen_attention(
+    query: torch.Tensor,  # [total_tokens, heads, head_dim]
+    key: torch.Tensor,    # [total_tokens, heads, head_dim]
+    value: torch.Tensor,  # [total_tokens, heads, head_dim]
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    *,
+    query_position_starts: list[int],
+    causal=False,
+):
+    num_seq = len(cu_seqlens_q) - 1
+    local_outputs = []
+
+    for i in range(num_seq):
+        q_start = cu_seqlens_q[i].item()
+        q_end = cu_seqlens_q[i + 1].item()
+
+        k_start = cu_seqlens_k[i].item()
+        k_end = cu_seqlens_k[i + 1].item()
+
+        q_i = query[q_start:q_end] # [T, H, D]
+        k_i = key[k_start:k_end]   # [T, H, D]
+        v_i = value[k_start:k_end] # [T, H, D]
+
+        q_i = q_i[None, :, :, :]  # [1, T, H, D]
+        q_i = q_i.transpose(1, 2) # [1, H, T, D]
+
+        k_i = k_i[None, :, :, :]  # [1, T, H, D]
+        k_i = k_i.transpose(1, 2) # [1, H, T, D]
+
+        v_i = v_i[None, :, :, :]  # [1, T, H, D]
+        v_i = v_i.transpose(1, 2) # [1, H, T, D]
+
+        # Create the mask
+        causal_mask = None
+        if causal:
+            q_positions = query_position_starts[i] + torch.arange(q_end - q_start)
+            k_positions = torch.arange(k_end - k_start)
+            causal_mask = q_positions[:, None] >= k_positions[None, :]
+
+        o_i = F.scaled_dot_product_attention(
+            query=q_i,
+            key=k_i,
+            value=v_i,
+            is_causal=False,
+            attn_mask=causal_mask
+        ) # [1, H, T, D]
+
+        o_i = o_i.squeeze(0)      # [H, T, D]
+        o_i = o_i.transpose(0, 1) # [T, H, D]
+        local_outputs.append(o_i)
+
+    packed_out = torch.concat(local_outputs, dim=0)
+    return packed_out
+
+
+def _repack_rank_major(
+    x, # [tokens, num_heads, head_dim]
+    local_cu_seqlens: torch.Tensor, # [num_sequences + 1]
+    world_size: int,
+) -> torch.Tensor:
+    local_total_tokens = local_cu_seqlens[-1].item()
+    rank_blocks = torch.split(x, split_size_or_sections=local_total_tokens, dim=0)
+
+    seq_blocks = []
+    num_seq = len(local_cu_seqlens) - 1
+
+    for i in range(num_seq):
+        start = local_cu_seqlens[i].item()
+        end = local_cu_seqlens[i + 1].item()
+
+        chunks = []
+
+        for rank_block in rank_blocks:
+            chunks.append(rank_block[start:end])
+
+        full_seq = torch.concat(chunks, dim=0)
+        seq_blocks.append(full_seq)
+
+    return torch.concat(seq_blocks, dim=0)
+
+def varlen_all_gather_attention(
+    query: torch.Tensor,        # [total_local_query_tokens, num_heads, head_dim]
+    key: torch.Tensor,          # [total_local_kv_tokens, num_heads, head_dim]
+    value: torch.Tensor,        # [total_local_kv_tokens, num_heads, value_dim]
+    cu_seqlens_q: torch.Tensor, # [num_sequences + 1]
+    cu_seqlens_k: torch.Tensor, # [num_sequences + 1]
     *,
     group=None,
     causal: bool = True,
 ) -> torch.Tensor:
-    """Stage 2: all-gather CP for packed variable-length sequences."""
-    raise NotImplementedError
+    """Stage 2: all-gather CP for packed variable-length sequences.
+
+    Example with two logical sequences and two CP ranks:
+
+        local Q/K/V lengths per sequence: [3, 2]
+        local cu_seqlens:                 [0, 3, 5]
+        global K/V lengths:               [6, 4]
+        global cu_seqlens_k:              [0, 6, 10]
+
+        rank 0 query offsets:              [0, 0]
+        rank 1 query offsets:              [3, 2]
+    """
+
+    # Shape: [num_sequences + 1]. For example, [0, 3, 5] describes
+    # sequence 0 as [0:3] and sequence 1 as [3:5].
+    assert len(cu_seqlens_k) == len(cu_seqlens_q)
+    num_seq = len(cu_seqlens_q) - 1  # scalar: number of logical sequences
+
+    # Shape: [num_sequences]. Example: diff([0, 3, 5]) -> [3, 2].
+    local_q_lengths = torch.diff(cu_seqlens_q)
+    local_k_lengths = torch.diff(cu_seqlens_k)
+
+    # Initial self-attention contract: local Q and local K/V lengths match.
+    assert len(local_k_lengths) == len(local_q_lengths)
+
+    # Scalars describing the active CP process group.
+    world_size = dist.get_world_size(group)  # example: 2
+    rank = dist.get_rank(group)              # example: 0 or 1
+
+    # Shape: [num_sequences]. Example: [3, 2] * 2 -> [6, 4].
+    global_k_lengths = world_size * local_k_lengths
+
+    # Shape: [num_sequences]. Global position of each rank's first local
+    # query token. Example for rank 1: [3, 2].
+    query_position_starts = rank * local_q_lengths
+
+    # Shape: [num_sequences + 1]. Example: [6, 4] -> [0, 6, 10].
+    global_cu_seqlens_k = torch.cat(
+        (
+            global_k_lengths.new_zeros(1),
+            torch.cumsum(global_k_lengths, dim=0),
+        )
+    )
+
+    # Gather KV tensors
+    global_key = all_gather_autograd(key, group=group, dim=0) # [total_global_key_tokens, num_heads, head_dim]
+    global_key = _repack_rank_major(global_key, cu_seqlens_k, world_size)
+
+    global_value = all_gather_autograd(value, group=group, dim=0) # [total_global_value_tokens, num_heads, head_dim]
+    global_value = _repack_rank_major(global_value, cu_seqlens_k, world_size)
+
+    # query: [total_local_query_tokens, heads, head_dim]
+    # key/value: [total_global_kv_tokens, heads, head_dim] after gathering
+    # cu_seqlens_q: [num_sequences + 1], local Q boundaries
+    # global_cu_seqlens_k: [num_sequences + 1], global K/V boundaries
+    return _local_varlen_attention(
+        query,
+        global_key,
+        global_value,
+        cu_seqlens_q,
+        global_cu_seqlens_k,
+        causal=causal,
+        query_position_starts=query_position_starts.tolist()
+    )
 
 
 def ring_attention(

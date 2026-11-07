@@ -17,6 +17,7 @@ from cs336_systems.context_parallel import (
     ContextParallelConfig,
     all_gather_attention,
     exchange_context_partition,
+    _local_varlen_attention,
     hybrid_ring_ulysses_attention,
     ring_attention,
     ulysses_attention,
@@ -179,12 +180,203 @@ def test_stage_1_wrapper_matches_reference_on_one_rank():
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 2: implement packed varlen attention")
-def test_stage_2_varlen_all_gather_preserves_sequence_boundaries():
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_2_varlen_attention_matches_per_sequence_reference(causal):
     query, key, value = _inputs(sequence_length=5)
+    query = query[0].transpose(0, 1).contiguous()
+    key = key[0].transpose(0, 1).contiguous()
+    value = value[0].transpose(0, 1).contiguous()
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-    actual = varlen_all_gather_attention(query[0].transpose(0, 1), key[0].transpose(0, 1), value[0].transpose(0, 1), cu_seqlens, cu_seqlens, causal=False)
+
+    actual = _local_varlen_attention(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        cu_seqlens,
+        causal=causal,
+        query_position_starts=[0, 0],
+    )
+
+    reference_outputs = []
+    for i in range(len(cu_seqlens) - 1):
+        start = cu_seqlens[i].item()
+        end = cu_seqlens[i + 1].item()
+        q_i = query[start:end].transpose(0, 1).unsqueeze(0)
+        k_i = key[start:end].transpose(0, 1).unsqueeze(0)
+        v_i = value[start:end].transpose(0, 1).unsqueeze(0)
+        reference_i = torch.nn.functional.scaled_dot_product_attention(
+            q_i,
+            k_i,
+            v_i,
+            is_causal=causal,
+        )
+        reference_outputs.append(reference_i.squeeze(0).transpose(0, 1))
+
+    expected = torch.cat(reference_outputs, dim=0)
     assert actual.shape == (5, 2, 4)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def _pack_local_sequence_chunks(x, rank, local_lengths):
+    chunks = []
+    start = 0
+    for local_length in local_lengths:
+        end = start + local_length * 2
+        local_start = start + rank * local_length
+        local_end = local_start + local_length
+        chunks.append(x[local_start:local_end])
+        start = end
+    return torch.cat(chunks, dim=0).contiguous()
+
+
+def _varlen_all_gather_forward_worker(rank, world_size, causal):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(789)
+
+    heads, head_dim = 2, 4
+    global_lengths = [4, 6]
+    local_lengths = [2, 3]
+    global_total_tokens = sum(global_lengths)
+
+    query = torch.randn(global_total_tokens, heads, head_dim, device=device)
+    key = torch.randn(global_total_tokens, heads, head_dim, device=device)
+    value = torch.randn(global_total_tokens, heads, head_dim, device=device)
+
+    local_query = _pack_local_sequence_chunks(query, rank, local_lengths)
+    local_key = _pack_local_sequence_chunks(key, rank, local_lengths)
+    local_value = _pack_local_sequence_chunks(value, rank, local_lengths)
+    local_cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
+
+    actual = varlen_all_gather_attention(
+        local_query,
+        local_key,
+        local_value,
+        local_cu_seqlens,
+        local_cu_seqlens,
+        causal=causal,
+    )
+
+    reference_outputs = []
+    start = 0
+    for sequence_length in global_lengths:
+        end = start + sequence_length
+        q_i = query[start:end].transpose(0, 1).unsqueeze(0)
+        k_i = key[start:end].transpose(0, 1).unsqueeze(0)
+        v_i = value[start:end].transpose(0, 1).unsqueeze(0)
+        output_i = torch.nn.functional.scaled_dot_product_attention(
+            q_i,
+            k_i,
+            v_i,
+            is_causal=causal,
+        )
+        reference_outputs.append(output_i.squeeze(0).transpose(0, 1))
+        start = end
+
+    reference = torch.cat(reference_outputs, dim=0)
+    expected = _pack_local_sequence_chunks(reference, rank, local_lengths)
+
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_2_varlen_all_gather_matches_reference_across_two_cpu_processes(causal):
+    mp.spawn(
+        _varlen_all_gather_forward_worker,
+        args=(2, causal),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _varlen_all_gather_backward_worker(rank, world_size, causal):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(890)
+
+    heads, head_dim = 2, 4
+    global_lengths = [4, 6]
+    local_lengths = [2, 3]
+    global_total_tokens = sum(global_lengths)
+
+    full_query = torch.randn(
+        global_total_tokens, heads, head_dim, device=device, requires_grad=True
+    )
+    full_key = torch.randn(
+        global_total_tokens, heads, head_dim, device=device, requires_grad=True
+    )
+    full_value = torch.randn(
+        global_total_tokens, heads, head_dim, device=device, requires_grad=True
+    )
+    grad_output = torch.randn(global_total_tokens, heads, head_dim, device=device)
+
+    reference_outputs = []
+    start = 0
+    for sequence_length in global_lengths:
+        end = start + sequence_length
+        q_i = full_query[start:end].transpose(0, 1).unsqueeze(0)
+        k_i = full_key[start:end].transpose(0, 1).unsqueeze(0)
+        v_i = full_value[start:end].transpose(0, 1).unsqueeze(0)
+        output_i = torch.nn.functional.scaled_dot_product_attention(
+            q_i,
+            k_i,
+            v_i,
+            is_causal=causal,
+        )
+        reference_outputs.append(output_i.squeeze(0).transpose(0, 1))
+        start = end
+
+    reference_output = torch.cat(reference_outputs, dim=0)
+    (reference_output * grad_output).sum().backward()
+
+    expected_query_grad = _pack_local_sequence_chunks(
+        full_query.grad, rank, local_lengths
+    )
+    expected_key_grad = _pack_local_sequence_chunks(
+        full_key.grad, rank, local_lengths
+    )
+    expected_value_grad = _pack_local_sequence_chunks(
+        full_value.grad, rank, local_lengths
+    )
+
+    local_query = _pack_local_sequence_chunks(
+        full_query.detach(), rank, local_lengths
+    ).requires_grad_()
+    local_key = _pack_local_sequence_chunks(
+        full_key.detach(), rank, local_lengths
+    ).requires_grad_()
+    local_value = _pack_local_sequence_chunks(
+        full_value.detach(), rank, local_lengths
+    ).requires_grad_()
+    local_cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
+
+    actual_output = varlen_all_gather_attention(
+        local_query,
+        local_key,
+        local_value,
+        local_cu_seqlens,
+        local_cu_seqlens,
+        causal=causal,
+    )
+    local_grad_output = _pack_local_sequence_chunks(
+        grad_output, rank, local_lengths
+    )
+    (actual_output * local_grad_output).sum().backward()
+
+    torch.testing.assert_close(local_query.grad, expected_query_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_key.grad, expected_key_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_value.grad, expected_value_grad, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_2_varlen_all_gather_backward_matches_reference(causal):
+    mp.spawn(
+        _varlen_all_gather_backward_worker,
+        args=(2, causal),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 3: implement ring communication and online softmax")
