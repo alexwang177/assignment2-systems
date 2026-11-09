@@ -9,6 +9,11 @@ learning order is:
 4. Ulysses (all-to-all) attention;
 5. hybrid ring/Ulysses attention.
 
+Stretch goals:
+
+6. variable-length ring attention;
+7. variable-length Ulysses attention.
+
 Tensor layout for fixed-length attention is ``[..., heads, sequence, head_dim]``.
 The sequence dimension is partitioned across a context-parallel process group.
 For varlen attention, packed Q/K/V tensors use ``[tokens, heads, head_dim]`` and
@@ -339,11 +344,29 @@ def varlen_all_gather_attention(
         query_position_starts=query_position_starts.tolist()
     )
 
+def _exchange_kv_block(x, group=None):
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    send_to = (rank + 1) % world_size
+    receive_from = (rank - 1) % world_size
+
+    recv_buffer = torch.empty_like(x)
+
+    send_op = dist.P2POp(dist.isend, x, send_to, group)
+    recv_op = dist.P2POp(dist.irecv, recv_buffer, receive_from, group)
+
+    work_handles = dist.batch_isend_irecv([send_op, recv_op])
+    for h in work_handles:
+        h.wait()
+
+    return recv_buffer
+    
 
 def ring_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    query: torch.Tensor, # [batch, heads, local_sequence, head_dim]
+    key: torch.Tensor,   # [batch, heads, local_sequence, head_dim]
+    value: torch.Tensor, # [batch, heads, local_sequence, head_dim]
     *,
     group=None,
     causal: bool = True,
@@ -351,7 +374,17 @@ def ring_attention(
     key_start: int = 0,
 ) -> torch.Tensor:
     """Stage 3: circulate K/V blocks and combine them with online softmax."""
-    raise NotImplementedError
+    
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    for i in range(world_size):
+        # Compute attn output for the current KV block
+        local_attn_out = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+        # Exchange KV blocks
+        key = _exchange_kv_block(key, group=group)
+        value = _exchange_kv_block(value, group=group)
 
 
 def ulysses_attention(
@@ -376,4 +409,32 @@ def hybrid_ring_ulysses_attention(
     causal: bool = True,
 ) -> torch.Tensor:
     """Stage 5: compose Ulysses redistribution with ring attention."""
+    raise NotImplementedError
+
+
+def varlen_ring_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    group=None,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Stretch goal: ring attention for packed variable-length sequences."""
+    raise NotImplementedError
+
+
+def varlen_ulysses_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    group=None,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Stretch goal: Ulysses attention for packed variable-length sequences."""
     raise NotImplementedError

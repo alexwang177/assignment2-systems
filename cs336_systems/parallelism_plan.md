@@ -15,6 +15,8 @@ interfaces for the remaining topics in `AGENTS.md`.
    - ring attention with online softmax
    - Ulysses/all-to-all attention
    - hybrid ring/Ulysses attention
+   - **stretch goal:** variable-length ring attention
+   - **stretch goal:** variable-length Ulysses attention
 6. Expert parallelism
 7. N-dimensional composition
 

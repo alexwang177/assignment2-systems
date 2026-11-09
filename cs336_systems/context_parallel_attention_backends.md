@@ -254,4 +254,7 @@ For this repository, study the backends in this order:
 4. FlexAttention masks and block masks.
 5. Varlen attention without CP.
 6. Varlen all-gather CP.
-7. Varlen Ulysses CP.
+7. Fixed-length ring attention.
+8. Fixed-length Ulysses attention.
+9. **Stretch goal:** varlen Ulysses CP.
+10. **Stretch goal:** varlen ring CP.
