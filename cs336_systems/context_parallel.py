@@ -452,7 +452,7 @@ def ring_attention(
 
     running_max = torch.full((batch, heads, local_sequence_len,), float("-inf"))    # [batch, heads, local_queries]
     running_denom = torch.zeros((batch, heads, local_sequence_len,))                # [batch, heads, local_queries]
-    running_output = torch.zeros((batch, heads, local_sequence_len, value_dim,))    # [batch, heads, local_queries, value_dim]
+    running_numerator = torch.zeros((batch, heads, local_sequence_len, value_dim,))    # [batch, heads, local_queries, value_dim]
 
     for i in range(world_size):
         
@@ -462,18 +462,18 @@ def ring_attention(
 
         # 2. Compute statistics for the current KV block
         block_max = torch.amax(attn_scores, dim=-1) # [batch, heads, local_queries]
-        exp_attn_scores = torch.exp(attn_scores - block_max[..., None]) # [batch, heads, local_sequence, local_sequence]
+        exp_attn_scores = torch.exp(attn_scores - block_max[..., None]) # [batch, heads, local_queries, local_keys]
         block_denom = torch.sum(exp_attn_scores, dim=-1) # [batch, heads, local_queries]
-        block_output = exp_attn_scores @ value # [batch, heads, local_values, head_dim]
+        block_numerator = exp_attn_scores @ value # [batch, heads, local_values, head_dim]
 
         # 3. Merge the block into the running state
         new_max = torch.maximum(running_max, block_max) # [batch, heads, local_queries]
 
-        old_scale = torch.exp(running_max - new_max)
-        block_scale = torch.exp(block_max - new_max)
+        old_scale = torch.exp(running_max - new_max) # [batch, heads, local_queries]
+        block_scale = torch.exp(block_max - new_max) # [batch, heads, local_queries]
 
         running_denom = old_scale * running_denom + block_scale * block_denom
-        running_output = old_scale[..., None] * running_output + block_scale[..., None] * block_output
+        running_numerator = old_scale[..., None] * running_numerator + block_scale[..., None] * block_numerator
 
         running_max = new_max
 
@@ -482,8 +482,8 @@ def ring_attention(
             key = _exchange_kv_block(key, group=group)
             value = _exchange_kv_block(value, group=group)
 
-    output = running_output / running_denom[..., None]
-    return output
+    output = running_numerator / running_denom[..., None]
+    return output # [batch, heads, local_queries, value_dim]
 
 
 def ulysses_attention(
