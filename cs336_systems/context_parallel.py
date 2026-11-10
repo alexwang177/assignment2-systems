@@ -130,16 +130,6 @@ class ContextParallelAttention(nn.Module):
         raise NotImplementedError("Implement the selected context-parallel attention algorithm")
 
 
-def exchange_context_partition(x: torch.Tensor, *, group=None, async_op: bool = False):
-    """Exchange one local K/V context partition with a ring neighbor.
-
-    This is the communication primitive needed by ring attention.  Decide and
-    document the ring direction, ownership order, and asynchronous work-handle
-    contract before implementing it.
-    """
-    raise NotImplementedError
-
-
 def all_gather_attention(
     query: torch.Tensor, # [batch, heads, local_sequence, head_dim]
     key: torch.Tensor,   # [batch, heads, local_sequence, head_dim]
@@ -344,6 +334,17 @@ def varlen_all_gather_attention(
         query_position_starts=query_position_starts.tolist()
     )
 
+
+def exchange_context_partition(x: torch.Tensor, *, group=None):
+    """Exchange one local K/V context partition with a ring neighbor.
+
+    This is the communication primitive needed by ring attention.  Decide and
+    document the ring direction, ownership order, and asynchronous work-handle
+    contract before implementing it.
+    """
+    return _exchange_kv_block(x, group)
+
+
 def _exchange_kv_block(x, group=None):
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
@@ -362,11 +363,80 @@ def _exchange_kv_block(x, group=None):
 
     return recv_buffer
     
+"""
+
+ Ring loop state
+
+ For each rank, initialize:
+
+ ```text
+   running_max: [batch, heads, local_query_length]
+   running_sum: [batch, heads, local_query_length]
+   running_output: [batch, heads, local_query_length, value_dim]
+ ```
+
+ Initialize:
+
+ ```text
+   running_max = -inf
+   running_sum = 0
+   running_output = 0
+ ```
+
+ For each ring step
+
+ With the current K/V block:
+
+ 1. Compute scores:
+    ```text
+      scores = Q @ K_currentᵀ / sqrt(head_dim)
+    ```
+
+ 2. Compute block statistics:
+    ```text
+      block_max = max(scores, dim=key_dimension)
+
+      exp_scores = exp(scores - block_max[..., None])
+
+      block_sum = sum(exp_scores, dim=key_dimension)
+
+      block_output = exp_scores @ V_current
+    ```
+
+ 3. Merge the block into the running state:
+    ```text
+      new_max = max(running_max, block_max)
+
+      old_scale = exp(running_max - new_max)
+      block_scale = exp(block_max - new_max)
+
+      running_sum =
+          old_scale * running_sum
+          + block_scale * block_sum
+
+      running_output =
+          old_scale[..., None] * running_output
+          + block_scale[..., None] * block_output
+
+      running_max = new_max
+    ```
+
+ 4. Exchange K/V for the next iteration.
+
+ Do not exchange after the final iteration.
+
+ 5. Normalize at the end:
+
+ ```text
+   output = running_output / running_sum[..., None]
+ ```
+
+"""
 
 def ring_attention(
-    query: torch.Tensor, # [batch, heads, local_sequence, head_dim]
-    key: torch.Tensor,   # [batch, heads, local_sequence, head_dim]
-    value: torch.Tensor, # [batch, heads, local_sequence, head_dim]
+    query: torch.Tensor, # [batch, heads, local_queries, head_dim]
+    key: torch.Tensor,   # [batch, heads, local_keys, head_dim]
+    value: torch.Tensor, # [batch, heads, local_values, head_dim]
     *,
     group=None,
     causal: bool = True,
@@ -374,17 +444,46 @@ def ring_attention(
     key_start: int = 0,
 ) -> torch.Tensor:
     """Stage 3: circulate K/V blocks and combine them with online softmax."""
+    batch, heads, local_sequence_len, head_dim = query.shape
+    value_dim = value.shape[-1]
     
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
 
-    for i in range(world_size):
-        # Compute attn output for the current KV block
-        local_attn_out = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+    running_max = torch.full((batch, heads, local_sequence_len,), float("-inf"))    # [batch, heads, local_queries]
+    running_denom = torch.zeros((batch, heads, local_sequence_len,))                # [batch, heads, local_queries]
+    running_output = torch.zeros((batch, heads, local_sequence_len, value_dim,))    # [batch, heads, local_queries, value_dim]
 
-        # Exchange KV blocks
-        key = _exchange_kv_block(key, group=group)
-        value = _exchange_kv_block(value, group=group)
+    for i in range(world_size):
+        
+        # 1. Compute scores
+        key_T = key.transpose(-2, -1) # [batch, heads, head_dim, local_keys]
+        attn_scores = (query @ key_T) / head_dim ** 0.5 # [batch, heads, local_queries, local_keys]
+
+        # 2. Compute statistics for the current KV block
+        block_max = torch.amax(attn_scores, dim=-1) # [batch, heads, local_queries]
+        exp_attn_scores = torch.exp(attn_scores - block_max[..., None]) # [batch, heads, local_sequence, local_sequence]
+        block_denom = torch.sum(exp_attn_scores, dim=-1) # [batch, heads, local_queries]
+        block_output = exp_attn_scores @ value # [batch, heads, local_values, head_dim]
+
+        # 3. Merge the block into the running state
+        new_max = torch.maximum(running_max, block_max) # [batch, heads, local_queries]
+
+        old_scale = torch.exp(running_max - new_max)
+        block_scale = torch.exp(block_max - new_max)
+
+        running_denom = old_scale * running_denom + block_scale * block_denom
+        running_output = old_scale[..., None] * running_output + block_scale[..., None] * block_output
+
+        running_max = new_max
+
+        if i < world_size - 1:
+            # Exchange KV blocks
+            key = _exchange_kv_block(key, group=group)
+            value = _exchange_kv_block(value, group=group)
+
+    output = running_output / running_denom[..., None]
+    return output
 
 
 def ulysses_attention(

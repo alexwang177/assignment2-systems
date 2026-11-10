@@ -379,17 +379,65 @@ def test_stage_2_varlen_all_gather_backward_matches_reference(causal):
     )
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 3: implement ring communication and online softmax")
-def test_stage_3_ring_attention_matches_reference():
-    query, key, value = _inputs()
-    actual = ring_attention(query, key, value, causal=False)
-    expected = torch.nn.functional.scaled_dot_product_attention(query, key, value, is_causal=False)
+def _ring_attention_forward_worker(rank, world_size):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(901)
+
+    batch, heads, sequence, head_dim = 2, 2, 8, 4
+    query = torch.randn(batch, heads, sequence, head_dim, device=device)
+    key = torch.randn(batch, heads, sequence, head_dim, device=device)
+    value = torch.randn(batch, heads, sequence, head_dim, device=device)
+
+    local_query = query.chunk(world_size, dim=-2)[rank].contiguous()
+    local_key = key.chunk(world_size, dim=-2)[rank].contiguous()
+    local_value = value.chunk(world_size, dim=-2)[rank].contiguous()
+
+    actual = ring_attention(
+        local_query,
+        local_key,
+        local_value,
+        causal=False,
+        group=None,
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        is_causal=False,
+    )
+    expected = expected.chunk(world_size, dim=-2)[rank]
+
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 3: implement the ring exchange primitive")
-def test_stage_3_ring_exchange_has_a_defined_contract():
-    exchange_context_partition(torch.randn(2, 2, 4, 4))
+def test_stage_3_ring_attention_matches_reference_across_two_cpu_processes():
+    mp.spawn(
+        _ring_attention_forward_worker,
+        args=(2,),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _ring_exchange_worker(rank, world_size):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    x = torch.full((2, 2, 4, 4), float(rank), device=device)
+
+    exchanged = exchange_context_partition(x, group=None)
+    expected = torch.full_like(x, float(1 - rank))
+
+    torch.testing.assert_close(exchanged, expected)
+    _cleanup_process_group()
+
+
+def test_stage_3_ring_exchange_across_two_cpu_processes():
+    mp.spawn(
+        _ring_exchange_worker,
+        args=(2,),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 4: implement Ulysses all-to-all layout changes")
