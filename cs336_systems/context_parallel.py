@@ -433,6 +433,131 @@ def _exchange_kv_block(x, group=None):
 
 """
 
+"""
+ Then implement ring_attention as a custom torch.autograd.Function:
+
+ 1. Forward computes the ring output and saves local Q/K/V plus LSE/output.
+ 2. Backward replays the ring KV traversal.
+ 3. Accumulates local dQ, dK, dV.
+ 4. all_reduces dK and dV across the CP group.
+ 5. Returns gradients for the local input partitions.
+"""
+
+class _RingAttention(torch.autograd.Function):
+    """Autograd boundary for ring attention activations."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        group=None,
+        causal: bool = True,
+        query_start: int = 0,
+        key_start: int = 0,
+    ) -> torch.Tensor:
+        """Stage 3: circulate K/V blocks and combine them with online softmax."""
+        # Save the original local activations before the ring loop rebinds key
+        # and value to received buffers. The backward implementation will use
+        # these tensors when replaying the ring.
+        ctx.save_for_backward(query, key, value)
+        ctx.group = group
+        ctx.causal = causal
+        ctx.query_start = query_start
+        ctx.key_start = key_start
+
+        batch, heads, local_sequence_len, head_dim = query.shape
+        value_dim = value.shape[-1]
+        local_key_len = key.shape[-2]
+
+        rank = dist.get_rank(group)
+        world_size = dist.get_world_size(group)
+
+        running_max = torch.full(
+            (batch, heads, local_sequence_len),
+            float("-inf"),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        running_denom = torch.zeros(
+            (batch, heads, local_sequence_len),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        running_numerator = torch.zeros(
+            (batch, heads, local_sequence_len, value_dim),
+            device=query.device,
+            dtype=query.dtype,
+        )
+
+        query_position = query_start + torch.arange(
+            start=0,
+            end=local_sequence_len,
+            device=query.device,
+        )
+        current_key_start = key_start
+        current_owner = rank
+
+        for i in range(world_size):
+            # Prepare the global-position causal mask.
+            key_positions = current_key_start + torch.arange(
+                start=0,
+                end=local_key_len,
+                device=query.device,
+            )
+            causal_mask = query_position[..., None] >= key_positions[None, ...]
+
+            # Compute scores for the current KV block.
+            key_T = key.transpose(-2, -1)
+            attn_scores = (query @ key_T) / head_dim**0.5
+
+            if causal:
+                mask = causal_mask
+            else:
+                mask = torch.ones_like(causal_mask)
+
+            attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+
+            # Compute statistics for the current KV block.
+            has_valid = mask.any(dim=-1)
+            block_max = torch.amax(attn_scores, dim=-1)
+            block_max = torch.where(
+                has_valid,
+                block_max,
+                torch.zeros_like(block_max),
+            )
+
+            exp_attn_scores = torch.exp(attn_scores - block_max[..., None])
+            block_denom = torch.sum(exp_attn_scores, dim=-1)
+            block_numerator = exp_attn_scores @ value
+
+            # Merge the current block into the online-softmax state.
+            new_max = torch.maximum(running_max, block_max)
+            old_scale = torch.exp(running_max - new_max)
+            block_scale = torch.exp(block_max - new_max)
+
+            running_denom = old_scale * running_denom + block_scale * block_denom
+            running_numerator = (
+                old_scale[..., None] * running_numerator
+                + block_scale[..., None] * block_numerator
+            )
+            running_max = new_max
+
+            if i < world_size - 1:
+                key = _exchange_kv_block(key, group=group)
+                value = _exchange_kv_block(value, group=group)
+
+                current_owner = (current_owner - 1) % world_size
+                current_key_start = current_owner * local_key_len
+
+        return running_numerator / running_denom[..., None]
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        raise NotImplementedError("Ring attention backward is not implemented yet")
+
+
 def ring_attention(
     query: torch.Tensor, # [batch, heads, local_queries, head_dim]
     key: torch.Tensor,   # [batch, heads, local_keys, head_dim]
@@ -443,73 +568,15 @@ def ring_attention(
     query_start: int = 0,
     key_start: int = 0,
 ) -> torch.Tensor:
-    """Stage 3: circulate K/V blocks and combine them with online softmax."""
-    batch, heads, local_sequence_len, head_dim = query.shape
-    value_dim = value.shape[-1]
-    local_key_len = key.shape[-2]
-    
-    rank = dist.get_rank(group)
-    world_size = dist.get_world_size(group)
-
-    running_max = torch.full((batch, heads, local_sequence_len,), float("-inf"))    # [batch, heads, local_queries]
-    running_denom = torch.zeros((batch, heads, local_sequence_len,))                # [batch, heads, local_queries]
-    running_numerator = torch.zeros((batch, heads, local_sequence_len, value_dim,))    # [batch, heads, local_queries, value_dim]
-
-    query_position = query_start + torch.arange(start=0, end=local_sequence_len) # [local_queries]
-    current_key_start = key_start
-    current_owner = rank
-
-    for i in range(world_size):
-
-        # Prepare causal mask
-        key_positions = current_key_start + torch.arange(start=0, end=local_key_len) # [local_keys]
-        causal_mask = query_position[..., None] >= key_positions[None, ...] # [local_queries, local_keys]
-        
-        # 1. Compute scores
-        key_T = key.transpose(-2, -1) # [batch, heads, head_dim, local_keys]
-        attn_scores = (query @ key_T) / head_dim ** 0.5 # [batch, heads, local_queries, local_keys]
-
-        if causal:
-            mask = causal_mask
-        else:
-            mask = torch.ones_like(causal_mask)
-
-        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
-
-        # 2. Compute statistics for the current KV block
-        has_valid = mask.any(dim=-1)
-        block_max = torch.amax(attn_scores, dim=-1) # [batch, heads, local_queries]
-        block_max = torch.where(
-            has_valid, 
-            block_max,
-            torch.zeros_like(block_max),
-        )
-
-        exp_attn_scores = torch.exp(attn_scores - block_max[..., None]) # [batch, heads, local_queries, local_keys]
-        block_denom = torch.sum(exp_attn_scores, dim=-1) # [batch, heads, local_queries]
-        block_numerator = exp_attn_scores @ value # [batch, heads, local_values, head_dim]
-
-        # 3. Merge the block into the running state
-        new_max = torch.maximum(running_max, block_max) # [batch, heads, local_queries]
-
-        old_scale = torch.exp(running_max - new_max) # [batch, heads, local_queries]
-        block_scale = torch.exp(block_max - new_max) # [batch, heads, local_queries]
-
-        running_denom = old_scale * running_denom + block_scale * block_denom
-        running_numerator = old_scale[..., None] * running_numerator + block_scale[..., None] * block_numerator
-
-        running_max = new_max
-
-        if i < world_size - 1:
-            # Exchange KV blocks
-            key = _exchange_kv_block(key, group=group)
-            value = _exchange_kv_block(value, group=group)
-
-            current_owner = (current_owner - 1) % world_size
-            current_key_start = current_owner * local_key_len
-
-    output = running_numerator / running_denom[..., None]
-    return output # [batch, heads, local_queries, value_dim]
+    return _RingAttention.apply(
+        query,
+        key,
+        value,
+        group,
+        causal,
+        query_start,
+        key_start,
+    )
 
 
 def ulysses_attention(
