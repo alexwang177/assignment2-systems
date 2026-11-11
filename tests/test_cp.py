@@ -420,6 +420,50 @@ def test_stage_3_ring_attention_matches_reference_across_two_cpu_processes():
     )
 
 
+def _ring_attention_causal_forward_worker(rank, world_size):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(902)
+
+    batch, heads, sequence, head_dim = 2, 2, 8, 4
+    local_sequence = sequence // world_size
+    query = torch.randn(batch, heads, sequence, head_dim, device=device)
+    key = torch.randn(batch, heads, sequence, head_dim, device=device)
+    value = torch.randn(batch, heads, sequence, head_dim, device=device)
+
+    local_query = query.chunk(world_size, dim=-2)[rank].contiguous()
+    local_key = key.chunk(world_size, dim=-2)[rank].contiguous()
+    local_value = value.chunk(world_size, dim=-2)[rank].contiguous()
+
+    actual = ring_attention(
+        local_query,
+        local_key,
+        local_value,
+        causal=True,
+        query_start=rank * local_sequence,
+        key_start=rank * local_sequence,
+        group=None,
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        is_causal=True,
+    )
+    expected = expected.chunk(world_size, dim=-2)[rank]
+
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+def test_stage_3_ring_causal_attention_matches_reference_across_two_cpu_processes():
+    mp.spawn(
+        _ring_attention_causal_forward_worker,
+        args=(2,),
+        nprocs=2,
+        join=True,
+    )
+
+
 def _ring_exchange_worker(rank, world_size):
     device = _setup_process_group(rank, world_size, backend="gloo")
     x = torch.full((2, 2, 4, 4), float(rank), device=device)
