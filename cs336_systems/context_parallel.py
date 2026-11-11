@@ -345,17 +345,25 @@ def exchange_context_partition(x: torch.Tensor, *, group=None):
     return _exchange_kv_block(x, group)
 
 
-def _exchange_kv_block(x, group=None):
+def _exchange_kv_block(x, group=None, backwards=False):
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
 
-    send_to = (rank + 1) % world_size
-    receive_from = (rank - 1) % world_size
+    if backwards:
+        send_to = (rank - 1) % world_size
+        receive_from = (rank + 1) % world_size
+    else:
+        send_to = (rank + 1) % world_size
+        receive_from = (rank - 1) % world_size
 
+    return _send_and_recv_kv_block(x, send_to, receive_from, group)
+
+
+def _send_and_recv_kv_block(x, send_to: int, recv_from: int, group=None):
     recv_buffer = torch.empty_like(x)
 
     send_op = dist.P2POp(dist.isend, x, send_to, group)
-    recv_op = dist.P2POp(dist.irecv, recv_buffer, receive_from, group)
+    recv_op = dist.P2POp(dist.irecv, recv_buffer, recv_from, group)
 
     work_handles = dist.batch_isend_irecv([send_op, recv_op])
     for h in work_handles:
@@ -441,6 +449,27 @@ def _exchange_kv_block(x, group=None):
  3. Accumulates local dQ, dK, dV.
  4. all_reduces dK and dV across the CP group.
  5. Returns gradients for the local input partitions.
+
+
+ So the full backward formulas are:
+
+ ```text
+   dV = Pᵀ G
+
+   delta = sum(G * O, dim=value_dim)
+   dS = P * ((G Vᵀ) - delta[..., None])
+
+   dQ = dS K / sqrt(d)
+   dK = dSᵀ Q / sqrt(d)
+ ```
+
+ For ring attention, apply these formulas once per circulating KV block:
+
+ - accumulate every block’s contribution into dQ;
+ - accumulate local dK and dV;
+ - all-reduce dK and dV across ranks afterward.
+
+ The next useful exercise is to write these formulas down with the exact shapes in your implementation before touching backward().
 """
 
 class _RingAttention(torch.autograd.Function):
@@ -461,11 +490,13 @@ class _RingAttention(torch.autograd.Function):
         # Save the original local activations before the ring loop rebinds key
         # and value to received buffers. The backward implementation will use
         # these tensors when replaying the ring.
-        ctx.save_for_backward(query, key, value)
         ctx.group = group
         ctx.causal = causal
         ctx.query_start = query_start
         ctx.key_start = key_start
+
+        org_key = key
+        org_value = value
 
         batch, heads, local_sequence_len, head_dim = query.shape
         value_dim = value.shape[-1]
@@ -551,12 +582,105 @@ class _RingAttention(torch.autograd.Function):
                 current_owner = (current_owner - 1) % world_size
                 current_key_start = current_owner * local_key_len
 
+        output = running_numerator / running_denom[..., None]
+        lse = running_max + torch.log(running_denom) # log of the softmax denominator
+
+        ctx.save_for_backward(query, org_key, org_value, output, lse)
         return running_numerator / running_denom[..., None]
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        raise NotImplementedError("Ring attention backward is not implemented yet")
+        """
+            dV = Pᵀ G
 
+            delta = sum(G * O, dim=value_dim)
+            dS = P * ((G Vᵀ) - delta[..., None])
+
+            dQ = dS K / sqrt(d)
+            dK = dSᵀ Q / sqrt(d)
+        """
+        
+        query, key, value, output, lse = ctx.saved_tensors
+        batch, heads, local_sequence_len, head_dim = query.shape
+        value_dim = value.shape[-1]
+        local_key_len = key.shape[-2]
+
+        dQ, dK, dV = torch.zeros_like(query), torch.zeros_like(key), torch.zeros_like(value)
+        G = grad_output # [batch, heads, local_queries, value_dim]
+
+        rank = dist.get_rank(ctx.group)
+        world_size = dist.get_world_size(ctx.group)
+
+        query_position = ctx.query_start + torch.arange(
+            start=0,
+            end=local_sequence_len,
+            device=query.device,
+        )
+        current_key_start = ctx.key_start
+        current_owner = rank
+
+        for i in range(world_size):
+            # Prepare the global-position causal mask.
+            key_positions = current_key_start + torch.arange(
+                start=0,
+                end=local_key_len,
+                device=query.device,
+            )
+            causal_mask = query_position[..., None] >= key_positions[None, ...]
+
+            key_T = key.transpose(-2, -1) # # [batch, heads, head_dim, local_keys]
+
+            if ctx.causal:
+                mask = causal_mask
+            else:
+                mask = torch.ones_like(causal_mask)
+
+            scores_block = query @ key_T / head_dim ** 0.5      # [batch, head, local_queries, local_keys]
+            scores_block = scores_block.masked_fill(~mask, float("-inf"))
+            P_block = torch.exp(scores_block - lse[..., None])  # [batch, head, local_queries, local_keys]
+
+            P_block_T = P_block.transpose(-2, -1) # [batch, head, local_keys, local_queries]
+            dV_block = P_block_T @ G # [batch, head, local_keys, value_dim]
+
+            value_T = value.transpose(-2, -1) # [batch, heads, value_dim, local_values]
+            delta = (G * output).sum(dim=-1) # [batch, heads, local_queries]
+            dS = P_block * ((G @ value_T) - delta[..., None])
+
+            dQ += (dS @ key) / head_dim ** 0.5
+
+            dS_T = dS.transpose(-2, -1)
+            dK_block = (dS_T @ query) / head_dim ** 0.5 # [batch, heads, local_keys, head_dim]
+
+            # Send dK_block and dV_block to the correct owner
+            if current_owner == rank:
+                dK_block_to_acc = dK_block
+                dV_block_to_acc = dV_block
+            else:
+                dK_block_to_acc = _send_and_recv_kv_block(
+                    dK_block,
+                    send_to=current_owner, # (rank - i) % world_size
+                    recv_from=(rank + i) % world_size,
+                    group=ctx.group
+                )
+
+                dV_block_to_acc = _send_and_recv_kv_block(
+                    dV_block,
+                    send_to=current_owner,  # (rank - i) % world_size
+                    recv_from=(rank + i) % world_size,
+                    group=ctx.group
+                )
+
+            dK += dK_block_to_acc
+            dV += dV_block_to_acc
+
+            if i < world_size - 1:
+                key = _exchange_kv_block(key, group=ctx.group)
+                value = _exchange_kv_block(value, group=ctx.group)
+
+                current_owner = (current_owner - 1) % world_size
+                current_key_start = current_owner * local_key_len
+
+        return dQ, dK, dV, None, None, None, None
 
 def ring_attention(
     query: torch.Tensor, # [batch, heads, local_queries, head_dim]

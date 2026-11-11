@@ -464,6 +464,73 @@ def test_stage_3_ring_causal_attention_matches_reference_across_two_cpu_processe
     )
 
 
+def _ring_attention_backward_worker(rank, world_size, causal):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(903)
+
+    batch, heads, sequence, head_dim = 1, 2, 8, 4
+    local_sequence = sequence // world_size
+    full_query = torch.randn(batch, heads, sequence, head_dim, device=device, requires_grad=True)
+    full_key = torch.randn(batch, heads, sequence, head_dim, device=device, requires_grad=True)
+    full_value = torch.randn(batch, heads, sequence, head_dim, device=device, requires_grad=True)
+    grad_output = torch.randn(batch, heads, sequence, head_dim, device=device)
+
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        full_query,
+        full_key,
+        full_value,
+        is_causal=causal,
+    )
+    (reference_output * grad_output).sum().backward()
+
+    expected_query_grad = full_query.grad.chunk(world_size, dim=-2)[rank]
+    expected_key_grad = full_key.grad.chunk(world_size, dim=-2)[rank]
+    expected_value_grad = full_value.grad.chunk(world_size, dim=-2)[rank]
+    expected_output = reference_output.detach().chunk(world_size, dim=-2)[rank]
+
+    local_query = full_query.detach().chunk(world_size, dim=-2)[rank].contiguous().requires_grad_()
+    local_key = full_key.detach().chunk(world_size, dim=-2)[rank].contiguous().requires_grad_()
+    local_value = full_value.detach().chunk(world_size, dim=-2)[rank].contiguous().requires_grad_()
+    local_grad_output = grad_output.chunk(world_size, dim=-2)[rank]
+
+    actual_output = ring_attention(
+        local_query,
+        local_key,
+        local_value,
+        causal=causal,
+        query_start=rank * local_sequence,
+        key_start=rank * local_sequence,
+        group=None,
+    )
+    (actual_output * local_grad_output).sum().backward()
+
+    torch.testing.assert_close(actual_output, expected_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_query.grad, expected_query_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_key.grad, expected_key_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_value.grad, expected_value_grad, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_3_ring_attention_backward_matches_reference_across_two_cpu_processes(causal):
+    mp.spawn(
+        _ring_attention_backward_worker,
+        args=(2, causal),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_3_ring_attention_backward_matches_reference_across_four_cpu_processes(causal):
+    mp.spawn(
+        _ring_attention_backward_worker,
+        args=(4, causal),
+        nprocs=4,
+        join=True,
+    )
+
+
 def _ring_exchange_worker(rank, world_size):
     device = _setup_process_group(rank, world_size, backend="gloo")
     x = torch.full((2, 2, 4, 4), float(rank), device=device)
