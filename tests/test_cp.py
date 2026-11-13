@@ -551,6 +551,49 @@ def test_stage_3_ring_exchange_across_two_cpu_processes():
     )
 
 
+def _ulysses_attention_forward_worker(rank, world_size, causal):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(904)
+
+    batch, heads, sequence, head_dim = 2, 4, 8, 3
+    full_query = torch.randn(batch, heads, sequence, head_dim, device=device)
+    full_key = torch.randn(batch, heads, sequence, head_dim, device=device)
+    full_value = torch.randn(batch, heads, sequence, head_dim, device=device)
+
+    local_query = full_query.chunk(world_size, dim=-2)[rank].contiguous()
+    local_key = full_key.chunk(world_size, dim=-2)[rank].contiguous()
+    local_value = full_value.chunk(world_size, dim=-2)[rank].contiguous()
+
+    actual = ulysses_attention(
+        local_query,
+        local_key,
+        local_value,
+        causal=causal,
+        group=None,
+    )
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        full_query,
+        full_key,
+        full_value,
+        is_causal=causal,
+    ).chunk(world_size, dim=-2)[rank]
+
+    assert actual.shape == local_query.shape
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_4_ulysses_attention_forward_matches_reference(causal):
+    mp.spawn(
+        _ulysses_attention_forward_worker,
+        args=(2, causal),
+        nprocs=2,
+        join=True,
+    )
+
+
 @pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 4: implement Ulysses all-to-all layout changes")
 def test_stage_4_ulysses_attention_matches_reference():
     query, key, value = _inputs()

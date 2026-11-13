@@ -335,6 +335,48 @@ def varlen_all_gather_attention(
     )
 
 
+def all_to_all(
+    output_chunks: list[torch.Tensor],
+    input_chunks: list[torch.Tensor],
+    *,
+    group=None,
+) -> list[torch.Tensor]:
+    """Gloo-compatible all-to-all implemented with point-to-point exchange.
+
+    ``input_chunks[peer]`` is sent to ``peer`` and ``output_chunks[peer]``
+    receives the corresponding tensor from ``peer``. Every rank must provide
+    one input and one output tensor per rank in the process group.
+    """
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+
+    if len(input_chunks) != world_size or len(output_chunks) != world_size:
+        raise ValueError("all_to_all requires one input and output tensor per rank")
+
+    operations = []
+    for peer in range(world_size):
+        if peer == rank:
+            output_chunks[peer].copy_(input_chunks[peer])
+            continue
+
+        operations.append(
+            dist.P2POp(dist.irecv, output_chunks[peer], peer, group)
+        )
+        operations.append(
+            dist.P2POp(
+                dist.isend,
+                input_chunks[peer].contiguous(),
+                peer,
+                group,
+            )
+        )
+
+    for work in dist.batch_isend_irecv(operations):
+        work.wait()
+
+    return output_chunks
+
+
 def exchange_context_partition(x: torch.Tensor, *, group=None):
     """Exchange one local K/V context partition with a ring neighbor.
 
@@ -704,15 +746,94 @@ def ring_attention(
 
 
 def ulysses_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    query: torch.Tensor, # [batch, heads, local_sequence, head_dim]
+    key: torch.Tensor,   # [batch, heads, local_sequence, head_dim]
+    value: torch.Tensor, # [batch, heads, local_sequence, head_dim]
     *,
     group=None,
     causal: bool = True,
 ) -> torch.Tensor:
     """Stage 4: redistribute sequence/head layout with all-to-all."""
-    raise NotImplementedError
+    world_size = dist.get_world_size(group)
+    batch, heads, local_sequence_len, head_dim = query.shape
+    value_dim = value.shape[-1]
+
+    if heads % world_size != 0:
+        raise ValueError("number of heads must be divisible by the process-group size")
+
+    local_heads = heads // world_size
+    query_head_chunks = [
+        torch.empty(
+            (batch, local_heads, local_sequence_len, head_dim),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        for _ in range(world_size)
+    ]
+    key_head_chunks = [
+        torch.empty(
+            (batch, local_heads, local_sequence_len, key.shape[-1]),
+            device=key.device,
+            dtype=key.dtype,
+        )
+        for _ in range(world_size)
+    ]
+    value_head_chunks = [
+        torch.empty(
+            (batch, local_heads, local_sequence_len, value_dim),
+            device=value.device,
+            dtype=value.dtype,
+        )
+        for _ in range(world_size)
+    ]
+
+    all_to_all(
+        query_head_chunks,
+        list(torch.chunk(query, world_size, dim=1)),
+        group=group,
+    )
+    all_to_all(
+        key_head_chunks,
+        list(torch.chunk(key, world_size, dim=1)),
+        group=group,
+    )
+    all_to_all(
+        value_head_chunks,
+        list(torch.chunk(value, world_size, dim=1)),
+        group=group,
+    )
+
+    # Each head chunk has shape [batch, heads // world_size, local_sequence, head_dim]
+
+    full_seq_query = torch.cat(query_head_chunks, dim=-2) # [batch, heads // world_size, full_sequence, head_dim]
+    full_seq_key = torch.cat(key_head_chunks, dim=-2) # [batch, heads // world_size, full_sequence, head_dim]
+    full_seq_value = torch.cat(value_head_chunks, dim=-2) # [batch, heads // world_size, full_sequence, head_dim]
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        full_seq_query,
+        full_seq_key,
+        full_seq_value,
+        is_causal=causal
+    ) # [batch, heads // world_size, full_sequence, head_dim]
+
+    attn_output_chunks = [
+        torch.empty(
+            (batch, local_heads, local_sequence_len, value_dim),
+            device=attn_output.device,
+            dtype=attn_output.dtype,
+        )
+        for _ in range(world_size)
+    ]
+    all_to_all(
+        attn_output_chunks,
+        list(torch.chunk(attn_output, world_size, dim=-2)),
+        group=group,
+    )
+
+    # Each attn output chunk has shape [batch, heads // world_size, local_sequence, head_dim]
+
+    full_head_attn_output = torch.cat(attn_output_chunks, dim=1) # [batch, heads, local_sequence, head_dim]
+    return full_head_attn_output
 
 
 def hybrid_ring_ulysses_attention(
