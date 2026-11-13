@@ -594,12 +594,76 @@ def test_stage_4_ulysses_attention_forward_matches_reference(causal):
     )
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 4: implement Ulysses all-to-all layout changes")
-def test_stage_4_ulysses_attention_matches_reference():
-    query, key, value = _inputs()
-    actual = ulysses_attention(query, key, value, causal=False)
-    expected = torch.nn.functional.scaled_dot_product_attention(query, key, value, is_causal=False)
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+def _ulysses_attention_backward_worker(rank, world_size, causal):
+    device = _setup_process_group(rank, world_size, backend="gloo")
+    torch.manual_seed(905)
+
+    batch, heads, sequence, head_dim = 1, 4, 8, 3
+    full_query = torch.randn(
+        batch, heads, sequence, head_dim, device=device, requires_grad=True
+    )
+    full_key = torch.randn(
+        batch, heads, sequence, head_dim, device=device, requires_grad=True
+    )
+    full_value = torch.randn(
+        batch, heads, sequence, head_dim, device=device, requires_grad=True
+    )
+    grad_output = torch.randn(batch, heads, sequence, head_dim, device=device)
+
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        full_query,
+        full_key,
+        full_value,
+        is_causal=causal,
+    )
+    (reference_output * grad_output).sum().backward()
+
+    expected_query_grad = full_query.grad.chunk(world_size, dim=-2)[rank]
+    expected_key_grad = full_key.grad.chunk(world_size, dim=-2)[rank]
+    expected_value_grad = full_value.grad.chunk(world_size, dim=-2)[rank]
+    expected_output = reference_output.detach().chunk(world_size, dim=-2)[rank]
+
+    local_query = (
+        full_query.detach().chunk(world_size, dim=-2)[rank]
+        .contiguous()
+        .requires_grad_()
+    )
+    local_key = (
+        full_key.detach().chunk(world_size, dim=-2)[rank]
+        .contiguous()
+        .requires_grad_()
+    )
+    local_value = (
+        full_value.detach().chunk(world_size, dim=-2)[rank]
+        .contiguous()
+        .requires_grad_()
+    )
+    local_grad_output = grad_output.chunk(world_size, dim=-2)[rank]
+
+    actual_output = ulysses_attention(
+        local_query,
+        local_key,
+        local_value,
+        causal=causal,
+        group=None,
+    )
+    (actual_output * local_grad_output).sum().backward()
+
+    torch.testing.assert_close(actual_output, expected_output, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_query.grad, expected_query_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_key.grad, expected_key_grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(local_value.grad, expected_value_grad, atol=1e-5, rtol=1e-5)
+    _cleanup_process_group()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_stage_4_ulysses_attention_backward_matches_reference(causal):
+    mp.spawn(
+        _ulysses_attention_backward_worker,
+        args=(2, causal),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Stage 5: implement hybrid CP")
