@@ -13,6 +13,10 @@ Variants used in this exercise:
 
 All variants should preserve forward values and parameter/input gradients.
 They trade activation memory for extra forward computation during backward.
+
+The ``toy_nonreentrant_checkpoint`` exercise below is intentionally narrower
+than PyTorch's implementation.  It is for studying the mechanism, not for
+production use.
 """
 
 from __future__ import annotations
@@ -130,6 +134,18 @@ def checkpoint_sequential(functions: Sequence[Callable], segments: int, input: t
         input,
         **kwargs,
     )
+
+
+def toy_nonreentrant_checkpoint(function: Callable, *args, **kwargs):
+    """Educational scaffold for a small non-reentrant checkpoint prototype.
+
+    Implement this separately from the production wrappers above.  The
+    intended first version may support only tensor positional arguments, a
+    single tensor output, deterministic functions, and no in-place mutation.
+    Study ``torch.autograd.graph.saved_tensors_hooks`` and compare the result
+    with ``torch.utils.checkpoint.checkpoint(..., use_reentrant=False)``.
+    """
+    raise NotImplementedError
 
 
 def activation_memory_note() -> str:

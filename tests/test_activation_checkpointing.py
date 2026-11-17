@@ -5,7 +5,13 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import CheckpointPolicy
 
-from cs336_systems.activation_checkpointing import FullAC, RegionAC, SelectiveAC, activation_memory_note
+from cs336_systems.activation_checkpointing import (
+    FullAC,
+    RegionAC,
+    SelectiveAC,
+    activation_memory_note,
+    toy_nonreentrant_checkpoint,
+)
 
 
 class BasicTransformerBlock(nn.Module):
@@ -84,3 +90,23 @@ def test_region_ac_checkpoints_only_a_transformer_stack_region():
     output = model(_inputs())
     output.square().sum().backward()
     assert output.shape == (2, 4, 8)
+
+
+@pytest.mark.xfail(raises=NotImplementedError, strict=False, reason="Toy non-reentrant AC is an exercise stub")
+def test_toy_nonreentrant_checkpoint_matches_forward_and_recomputes():
+    calls = 0
+    weight = torch.randn(8, 8, requires_grad=True)
+
+    def function(x):
+        nonlocal calls
+        calls += 1
+        return torch.tanh(x @ weight)
+
+    x = _inputs()
+    output = toy_nonreentrant_checkpoint(function, x)
+    output.square().sum().backward()
+
+    assert output.shape == x.shape
+    assert calls >= 2, "backward should rerun the checkpointed function"
+    assert x.grad is not None
+    assert weight.grad is not None
